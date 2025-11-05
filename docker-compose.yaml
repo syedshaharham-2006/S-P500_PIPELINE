@@ -1,0 +1,66 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+
+  airflow-init:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    entrypoint: ["airflow", "db", "init"]
+    user: "root"  # Root user for initialization (we change the ownership of the directories later)
+
+  airflow-webserver:
+    build: .
+    depends_on:
+      - airflow-init
+      - postgres
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    command: webserver
+    user: "root"  # Running as root to ensure directory permissions are set
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./config:/opt/airflow/config
+    entrypoint: /bin/bash -c "mkdir -p /opt/airflow/logs && chown -R airflow /opt/airflow/logs && airflow webserver"
+
+  airflow-scheduler:
+    build: .
+    depends_on:
+      - airflow-webserver
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    command: scheduler
+    user: "root"  # Running as root to ensure directory permissions are set
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./config:/opt/airflow/config
+    entrypoint: /bin/bash -c "mkdir -p /opt/airflow/logs && chown -R airflow /opt/airflow/logs && airflow scheduler"
+
+volumes:
+  postgres-db-volume:

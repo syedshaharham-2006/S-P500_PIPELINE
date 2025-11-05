@@ -1,0 +1,9 @@
+apache-airflow==2.9.1
+pandas
+requests
+yfinance
+boto3
+snowflake-connector-python
+psycopg2-binary
+html5lib
+pytz
