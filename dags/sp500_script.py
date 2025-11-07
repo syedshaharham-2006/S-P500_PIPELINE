@@ -3,7 +3,10 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.operators.python import PythonOperator
+from botocore.config import Config
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError, SSLError, ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
@@ -18,8 +21,7 @@ logger = logging.getLogger("airflow.task")
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
-    "email_on_failure": True,
-    "email": ["youremail@example.com"],
+    "email_on_failure": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
 }
@@ -29,7 +31,7 @@ dag = DAG(
     default_args=default_args,
     description="All S&P500 1-min OHLCV with S3 & Snowflake",
     schedule_interval="0 21 * * 1-5",
-    start_date=datetime(2025, 10, 27),
+    start_date=datetime(2025, 11, 6),
     catchup=False,
     tags=["sp500", "intraday", "snowflake", "s3", "enhanced"],
     max_active_runs=1,
@@ -66,6 +68,7 @@ def fetch_1min_data(**context):
         tickers = context["ti"].xcom_pull(key="tickers", task_ids="fetch_sp500_tickers")
         prev_trading_day = previous_trading_day_ny()
         day_str = prev_trading_day.strftime("%Y-%m-%d")
+        
         def fetch_ticker_data(symbol):
             try:
                 df = yf.download(
@@ -96,7 +99,6 @@ def fetch_1min_data(**context):
                         if col not in df.columns:
                             df[col] = None
                     df['Symbol'] = symbol
-                    # Save the NY time as 'Datetime'
                     df.rename(columns={'Datetime': 'Datetime'}, inplace=True)
                     return symbol, df
                 else:
@@ -104,6 +106,7 @@ def fetch_1min_data(**context):
             except Exception as exc:
                 logger.warning(f"{symbol}: fetch failed ({exc})")
                 return symbol, None
+        
         results = {}
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_ticker = {executor.submit(fetch_ticker_data, ticker): ticker for ticker in tickers}
@@ -111,14 +114,18 @@ def fetch_1min_data(**context):
                 symbol, data = future.result()
                 if data is not None:
                     results[symbol] = data
+
         if not results:
             raise ValueError(f"No 1-minute data retrieved for {day_str}!")
+
         # FIX: Ensure unique index for each DataFrame before concat
         frames = []
         for df in results.values():
             if df is not None:
-                df = df.reset_index(drop=True)
+                df = df.reset_index(drop=True)  # Ensure unique index for each DataFrame
                 frames.append(df)
+
+        # Concatenate the frames with a unique index
         combined_df = pd.concat(frames, ignore_index=True)
         context["ti"].xcom_push(key="raw_data", value=combined_df.to_json(date_format='iso', orient='records'))
     except Exception as e:
@@ -129,23 +136,28 @@ def transform_data(**context):
     try:
         raw_json = context["ti"].xcom_pull(key="raw_data", task_ids="fetch_1min_data")
         df = pd.read_json(StringIO(raw_json))
+        
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col not in df.columns:
                 logger.error(f"Missing column: {col}")
                 raise ValueError(f"Required column not found: {col}")
+
         if 'Symbol' not in df.columns:
             logger.error("Missing column: Symbol")
             raise ValueError("Required column not found: Symbol")
-        # Ensure datetime is localized and converted to NY time
+
         datetime_col = 'Datetime' if 'Datetime' in df.columns else df.columns[0]
         df[datetime_col] = pd.to_datetime(df[datetime_col])
-        # Localize and convert to NY time
+
         if df[datetime_col].dt.tz is None:
             df[datetime_col] = df[datetime_col].dt.tz_localize('UTC')
+        
         df[datetime_col] = df[datetime_col].dt.tz_convert('America/New_York')
         df = df.sort_values(['Symbol', datetime_col]).reset_index(drop=True)
+        
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             df[col] = df.groupby('Symbol')[col].fillna(method='ffill')
+        
         df['minute_returns'] = df.groupby('Symbol')['Close'].pct_change() * 100
         df['minute_returns'] = df['minute_returns'].fillna(0)
         df['trading_hours'] = df[datetime_col].dt.time
@@ -156,8 +168,8 @@ def transform_data(**context):
         df['close_change'] = df.groupby('Symbol')['Close'].diff().fillna(0)
         df['volume_change'] = df.groupby('Symbol')['Volume'].diff().fillna(0)
         df = df.rename(columns={'Symbol': 'symbol'})
-        # Save the properly localized NY timestamp
         df['Datetime'] = df[datetime_col]
+        
         context["ti"].xcom_push(key="transformed_data", value=df.to_json(date_format='iso', orient='records'))
     except Exception as e:
         logger.error(f"Failed during transformation: {str(e)}")
@@ -165,25 +177,45 @@ def transform_data(**context):
 
 def upload_to_s3(**context):
     try:
+        AWS_REGION = Variable.get("AWS_REGION", default_var="ap-south-1")
         S3_BUCKET = Variable.get("S3_BUCKET")
         S3_KEY_PREFIX = Variable.get("S3_KEY_PREFIX", default_var="sp500/")
+
+        # Use Airflow AWS Hook with proper config
         aws_hook = AwsBaseHook(aws_conn_id="aws_connection", client_type="s3")
-        s3_client = aws_hook.get_client_type("s3")
+        
+        # Explicitly set config with path-style addressing
+        config = Config(
+            region_name=AWS_REGION,
+            s3={'addressing_style': 'path'},  # Forces path-style: s3.ap-south-1.amazonaws.com/bucket/key
+            retries={'max_attempts': 3}
+        )
+        s3_client = aws_hook.get_client_type("s3", config=config)
+
         transformed_json = context["ti"].xcom_pull(key="transformed_data", task_ids="transform_data")
         df = pd.read_json(StringIO(transformed_json))
-        prev_trading_day = previous_trading_day_ny()
-        date_str = prev_trading_day.strftime('%Y%m%d')
+        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"sp500_all_1min_{date_str}_{timestamp}.csv"
+        filename = f"sp500_all_{timestamp}.csv"
         df.to_csv(filename, index=False)
-        s3_key = f"{S3_KEY_PREFIX}{filename}"
-        s3_client.upload_file(filename, S3_BUCKET, s3_key)
+        
+        s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{filename}"
+        
+        s3_client.upload_file(
+            Filename=filename,
+            Bucket=S3_BUCKET,
+            Key=s3_key
+        )
+        
         os.remove(filename)
         s3_path = f"s3://{S3_BUCKET}/{s3_key}"
         context["ti"].xcom_push(key="s3_path", value=s3_path)
+        logger.info(f"Successfully uploaded to {s3_path}")
+        
     except Exception as e:
         logger.error(f"Failed to upload to S3: {str(e)}")
         raise
+
 
 def load_to_snowflake(**context):
     try:
@@ -192,7 +224,8 @@ def load_to_snowflake(**context):
         hook = SnowflakeHook(snowflake_conn_id="snowflake_connection")
         conn = hook.get_conn()
         cursor = conn.cursor()
-        cursor.execute("""
+
+        cursor.execute(""" 
             CREATE TABLE IF NOT EXISTS SP500_1MIN_PRICES (
                 DATETIME TIMESTAMP_TZ,
                 OPEN FLOAT,
@@ -211,12 +244,13 @@ def load_to_snowflake(**context):
             )
             CLUSTER BY (TRADE_DATE, SYMBOL);
         """)
-        # Store NY time with time zone in Snowflake
+
         df['Datetime'] = pd.to_datetime(df['Datetime'])
         df['Datetime'] = df['Datetime'].dt.tz_localize("America/New_York", ambiguous='NaT', nonexistent='NaT') if df['Datetime'].dt.tz is None else df['Datetime']
         df['Datetime'] = df['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S%z')
         df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d')
         df['trading_hours'] = pd.to_datetime(df['trading_hours'], format='%H:%M:%S').dt.strftime('%H:%M:%S')
+
         insert_columns = [
             'Datetime', 'Open', 'High', 'Low', 'Close', 'Volume',
             'symbol', 'minute_returns', 'trading_hours', 'rolling_avg',
